@@ -20,8 +20,8 @@ STUBHUB_URL = (
 )
 QUANTITY = 4
 
-EMAIL_FROM = "testscraperemaileg@gmail.com"
-EMAIL_TO = "ethanagalvan05@gmail.com"
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
+EMAIL_TO = os.environ.get("EMAIL_TO", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 
 CHECK_INTERVAL_MINUTES = 15

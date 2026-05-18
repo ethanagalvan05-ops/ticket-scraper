@@ -5,7 +5,7 @@ import os
 import re
 import smtplib
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -132,6 +132,37 @@ def triggered_reasons(listing: dict, state: dict) -> list[str]:
     return reasons
 
 
+def compute_trends(history: list, current_price: float) -> dict:
+    """For each window, find the oldest entry within that lookback and compute delta."""
+    now = datetime.now()
+    windows = {
+        "1h":  timedelta(hours=1),
+        "1d":  timedelta(days=1),
+        "7d":  timedelta(days=7),
+        "14d": timedelta(days=14),
+        "30d": timedelta(days=30),
+    }
+    trends = {}
+    for label, delta in windows.items():
+        cutoff = now - delta
+        within = [e for e in history if datetime.fromisoformat(e["ts"]) >= cutoff]
+        if within:
+            ref = within[0]["price"]   # oldest entry in the window
+            change = current_price - ref
+            trends[label] = {"ref": ref, "change": change, "pct": change / ref * 100}
+        else:
+            trends[label] = None
+    # Always include baseline comparison
+    if history:
+        ref = history[0]["price"]
+        change = current_price - ref
+        trends["start"] = {"ref": ref, "change": change, "pct": change / ref * 100,
+                           "ts": history[0]["ts"]}
+    else:
+        trends["start"] = None
+    return trends
+
+
 STUBHUB_URL_HTML = htmllib.escape(STUBHUB_URL)
 
 
@@ -161,21 +192,55 @@ def _listing_html(listing: dict) -> str:
     </table>"""
 
 
-def send_digest(listing: dict) -> None:
+def _trend_row(label: str, data: dict | None) -> str:
+    if data is None:
+        return f'<tr><td style="padding:3px 12px 3px 0;color:#888;">{label}</td><td style="padding:3px 0;color:#aaa;">not enough data yet</td></tr>'
+    change = data["change"]
+    pct = data["pct"]
+    arrow = "▼" if change < 0 else "▲"
+    color = "#1e8c45" if change < 0 else "#d93025"  # green=down (good), red=up (bad)
+    sign = "" if change < 0 else "+"
+    return (
+        f'<tr><td style="padding:3px 12px 3px 0;color:#888;">{label}</td>'
+        f'<td style="padding:3px 0;color:{color};font-weight:bold;">'
+        f'{arrow} ${abs(change):.2f} ({sign}{pct:.1f}%) '
+        f'<span style="color:#aaa;font-weight:normal;font-size:13px;">vs ~${data["ref"]:.0f}</span>'
+        f'</td></tr>'
+    )
+
+
+def send_digest(listing: dict, trends: dict) -> None:
     price = listing["price"]
+    now_ct = datetime.now(timezone.utc).astimezone(ZoneInfo('America/Chicago'))
+
+    window_labels = {"1h": "Last hour", "1d": "Last 24h", "7d": "Last 7 days",
+                     "14d": "Last 14 days", "30d": "Last 30 days"}
+    trend_rows = "".join(_trend_row(lbl, trends.get(key)) for key, lbl in window_labels.items())
+
+    start = trends.get("start")
+    if start:
+        start_date = datetime.fromisoformat(start["ts"]).strftime("%b %d")
+        trend_rows += _trend_row(f"Since {start_date}", start)
+
     html = f"""
-    <div style="font-family:sans-serif;max-width:480px;">
+    <div style="font-family:sans-serif;max-width:520px;">
       <h2 style="margin-bottom:4px;">🎵 Noah Kahan — St. Louis</h2>
-      <p style="margin-top:0;color:#888;">Aug 2, 2026 &nbsp;·&nbsp; Hourly low as of {datetime.now(timezone.utc).astimezone(ZoneInfo('America/Chicago')).strftime('%I:%M %p CT')}</p>
-      <h3 style="margin-bottom:8px;">Cheapest listing this hour</h3>
+      <p style="margin-top:0;color:#888;">Aug 2, 2026 &nbsp;·&nbsp; as of {now_ct.strftime('%I:%M %p CT')}</p>
+      <h3 style="margin-bottom:8px;">Cheapest listing this period</h3>
       {_listing_html(listing)}
+      <h3 style="margin-bottom:4px;margin-top:20px;">Lowest price trends</h3>
+      <p style="margin-top:0;margin-bottom:8px;color:#888;font-size:13px;">How the cheapest ticket available has changed over time.</p>
+      <table style="border-collapse:collapse;font-family:sans-serif;font-size:14px;">
+        {trend_rows}
+      </table>
+      <p style="color:#888;font-size:12px;margin-top:6px;">Green ▼ = cheapest ticket got cheaper (good!). Red ▲ = cheapest ticket got more expensive.</p>
       <br>
       <a href="{STUBHUB_URL_HTML}" style="display:inline-block;padding:10px 20px;background:#1a73e8;color:white;text-decoration:none;border-radius:6px;font-weight:bold;">
         View Tickets on StubHub
       </a>
       <p style="color:#aaa;font-size:12px;margin-top:16px;">Set quantity to {QUANTITY} once the page loads.</p>
     </div>"""
-    _send(f"StubHub Hourly — Noah Kahan STL ~${price:.0f}/ticket", html)
+    _send(f"StubHub Update — Noah Kahan STL ~${price:.0f}/ticket", html)
 
 
 def send_alert(listing: dict, reasons: list[str]) -> None:
@@ -215,7 +280,7 @@ def run_once() -> None:
         state["baseline"] = price
         print(f"[{ts}] Baseline set: ${price:.2f}", flush=True)
 
-    state["history"] = (state["history"] + [{"ts": datetime.now().isoformat(), "price": price}])[-500:]
+    state["history"] = (state["history"] + [{"ts": datetime.now().isoformat(), "price": price}])[-10_000:]
 
     # Track hourly low
     hourly_low = state.get("hourly_low")
@@ -229,10 +294,11 @@ def run_once() -> None:
         datetime.fromisoformat(last_digest).hour // 2 != datetime.now().hour // 2
     )
     if new_hour and state["hourly_low"]:
-        send_digest(state["hourly_low"])
+        trends = compute_trends(state["history"], state["hourly_low"]["price"])
+        send_digest(state["hourly_low"], trends)
         state["last_digest"] = datetime.now().isoformat()
         state["hourly_low"] = None
-        print(f"[{ts}] Hourly digest sent.", flush=True)
+        print(f"[{ts}] Digest sent.", flush=True)
 
     reasons = triggered_reasons(listing, state)
     if reasons and not in_cooldown(state):

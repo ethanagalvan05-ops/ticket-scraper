@@ -135,14 +135,15 @@ STUBHUB_URL_HTML = htmllib.escape(STUBHUB_URL)
 
 
 def _send(subject: str, html: str) -> None:
+    recipients = [e.strip() for e in EMAIL_TO.split(",") if e.strip()]
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
+    msg["To"] = ", ".join(recipients)
     msg.attach(MIMEText(html, "html"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(EMAIL_FROM, GMAIL_APP_PASSWORD)
-        smtp.send_message(msg)
+        smtp.sendmail(EMAIL_FROM, recipients, msg.as_string())
 
 
 def _listing_html(listing: dict) -> str:

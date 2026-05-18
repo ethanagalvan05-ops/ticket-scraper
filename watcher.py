@@ -63,12 +63,14 @@ def scrape_lowest_listing() -> dict | None:
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
-            )
+            ),
+            extra_http_headers={"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"},
         ).new_page()
         Stealth().apply_stealth_sync(page)
 
+        bust = f"&_t={int(time.time())}"
         try:
-            page.goto(STUBHUB_URL, wait_until="domcontentloaded", timeout=30_000)
+            page.goto(STUBHUB_URL + bust, wait_until="domcontentloaded", timeout=30_000)
             page.wait_for_timeout(5_000)
             page.evaluate("window.scrollTo(0, 500)")
             page.wait_for_timeout(3_000)

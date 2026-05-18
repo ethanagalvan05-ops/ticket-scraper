@@ -1,0 +1,12 @@
+{
+  "baseline": 372.0,
+  "last_alerted": null,
+  "last_digest": "2026-05-18T07:47:22.806077",
+  "hourly_low": null,
+  "history": [
+    {
+      "ts": "2026-05-18T07:47:22.081741",
+      "price": 372.0
+    }
+  ]
+}

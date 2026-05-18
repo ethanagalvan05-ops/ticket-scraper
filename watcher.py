@@ -5,7 +5,8 @@ import os
 import re
 import smtplib
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -165,7 +166,7 @@ def send_digest(listing: dict) -> None:
     html = f"""
     <div style="font-family:sans-serif;max-width:480px;">
       <h2 style="margin-bottom:4px;">🎵 Noah Kahan — St. Louis</h2>
-      <p style="margin-top:0;color:#888;">Aug 2, 2026 &nbsp;·&nbsp; Hourly low as of {datetime.now().strftime('%I:%M %p')}</p>
+      <p style="margin-top:0;color:#888;">Aug 2, 2026 &nbsp;·&nbsp; Hourly low as of {datetime.now(timezone.utc).astimezone(ZoneInfo('America/Chicago')).strftime('%I:%M %p CT')}</p>
       <h3 style="margin-bottom:8px;">Cheapest listing this hour</h3>
       {_listing_html(listing)}
       <br>

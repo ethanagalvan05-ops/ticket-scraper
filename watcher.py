@@ -3,12 +3,10 @@ import html as htmllib
 import json
 import os
 import re
-import smtplib
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
@@ -23,14 +21,9 @@ QUANTITY = 4
 
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 EMAIL_TO = os.environ.get("EMAIL_TO", "")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
 
 CHECK_INTERVAL_MINUTES = 15
-ALERT_COOLDOWN_HOURS = 2    # minimum hours between alert emails
-
-# Thresholds — set either or both. None = disabled.
-PRICE_BELOW = 200           # alert when any listing drops below $200/ticket
-PRICE_DROP_PCT = None       # e.g. 15 → alert when price drops 15% from first reading
 
 STATE_FILE = Path("state.json")
 # ─────────────────────────────────────────────────────────────────────────────
@@ -39,7 +32,7 @@ STATE_FILE = Path("state.json")
 def load_state() -> dict:
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
-    return {"baseline": None, "last_alerted": None, "last_digest": None, "hourly_low": None, "history": []}
+    return {"baseline": None, "last_digest": None, "hourly_low": None, "history": []}
 
 
 def save_state(state: dict) -> None:
@@ -64,6 +57,7 @@ def scrape_lowest_listing() -> dict | None:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
+            proxy={"server": "http://p.webshare.io:80", "username": "mfrjvkvm-US-1", "password": "2l854o98csyy"},
             extra_http_headers={"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"},
         ).new_page()
         Stealth().apply_stealth_sync(page)
@@ -78,60 +72,38 @@ def scrape_lowest_listing() -> dict | None:
             browser.close()
             return None
 
-        # Each listing has a data-listing-id attribute with data-price and
-        # section/row in the first lines of innerText.
-        raw = page.evaluate("""() =>
-            [...document.querySelectorAll('[data-listing-id]')].map(el => ({
-                price: el.getAttribute('data-price'),
-                text: el.innerText,
-            }))
-        """)
-
+        html = page.content()
         browser.close()
 
-        listings = []
-        for item in raw:
-            lines = [l.strip() for l in item["text"].splitlines() if l.strip()]
-
-            # Prefer the all-in price (line before "incl. fees") over data-price
-            # which is the pre-fee base price.
-            price = None
-            for i, line in enumerate(lines):
-                if "incl. fees" in line.lower() and i > 0:
-                    price = _parse_price(lines[i - 1])
+        # sectionPopupData contains per-section cheapest listings already filtered
+        # by the quantity in the URL (?quantity=4). Parse it to get the true minimum.
+        start = html.find('"sectionPopupData":')
+        if start == -1:
+            return None
+        brace_start = html.index('{', start)
+        depth, i = 0, brace_start
+        while i < len(html):
+            if html[i] == '{':
+                depth += 1
+            elif html[i] == '}':
+                depth -= 1
+                if depth == 0:
                     break
-            if not price:
-                price = _parse_price(item["price"] or "")
-            if not price:
-                continue
+            i += 1
+        try:
+            sections = json.loads(html[brace_start:i+1])
+        except Exception:
+            return None
 
-            section = lines[0] if lines else "—"
-            row = lines[1] if len(lines) > 1 and lines[1].lower().startswith("row") else "—"
-            qty_line = next((l for l in lines if "ticket" in l.lower()), "—")
-            listings.append({"price": price, "section": section, "row": row, "qty": qty_line})
+        if not sections:
+            return None
 
-        return min(listings, key=lambda x: x["price"]) if listings else None
+        cheapest = min(sections.values(), key=lambda s: s.get("rawMinPrice", float("inf")))
+        price = cheapest.get("rawMinPrice")
+        if not price or not (10 < price < 10_000):
+            return None
 
-
-def in_cooldown(state: dict) -> bool:
-    if not state["last_alerted"]:
-        return False
-    elapsed_hours = (datetime.now() - datetime.fromisoformat(state["last_alerted"])).total_seconds() / 3600
-    return elapsed_hours < ALERT_COOLDOWN_HOURS
-
-
-def triggered_reasons(listing: dict, state: dict) -> list[str]:
-    price = listing["price"]
-    reasons = []
-    if PRICE_BELOW is not None and price < PRICE_BELOW:
-        reasons.append(f"price ${price:.2f} dropped below your threshold of ${PRICE_BELOW}")
-    if PRICE_DROP_PCT is not None and state["baseline"] is not None:
-        drop = (state["baseline"] - price) / state["baseline"] * 100
-        if drop >= PRICE_DROP_PCT:
-            reasons.append(
-                f"price dropped {drop:.1f}% from baseline ${state['baseline']:.2f}"
-            )
-    return reasons
+        return {"price": price, "section": "—", "row": cheapest.get("rowText", "—"), "qty": f"{cheapest.get('ticketCount', '?')} tickets"}
 
 
 def compute_trends(history: list, current_price: float) -> dict:
@@ -170,14 +142,18 @@ STUBHUB_URL_HTML = htmllib.escape(STUBHUB_URL)
 
 def _send(subject: str, html: str) -> None:
     recipients = [e.strip() for e in EMAIL_TO.split(",") if e.strip()]
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = ", ".join(recipients)
-    msg.attach(MIMEText(html, "html"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(EMAIL_FROM, GMAIL_APP_PASSWORD)
-        smtp.sendmail(EMAIL_FROM, recipients, msg.as_string())
+    payload = json.dumps({
+        "personalizations": [{"to": [{"email": r} for r in recipients]}],
+        "from": {"email": EMAIL_FROM},
+        "subject": subject,
+        "content": [{"type": "text/html", "value": html}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.sendgrid.com/v3/mail/send",
+        data=payload,
+        headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
+    )
+    urllib.request.urlopen(req)
 
 
 def _listing_html(listing: dict) -> str:
@@ -245,25 +221,6 @@ def send_digest(listing: dict, trends: dict) -> None:
     _send(f"StubHub Update — Noah Kahan STL ~${price:.0f}/ticket", html)
 
 
-def send_alert(listing: dict, reasons: list[str]) -> None:
-    price = listing["price"]
-    reasons_html = "".join(f"<li>{r}</li>" for r in reasons)
-    html = f"""
-    <div style="font-family:sans-serif;max-width:480px;">
-      <h2 style="margin-bottom:4px;color:#d93025;">🚨 Price Alert — Noah Kahan STL</h2>
-      <p style="margin-top:0;color:#888;">Aug 2, 2026</p>
-      <ul style="font-size:15px;padding-left:20px;">{reasons_html}</ul>
-      <h3 style="margin-bottom:8px;">Listing details</h3>
-      {_listing_html(listing)}
-      <br>
-      <a href="{STUBHUB_URL_HTML}" style="display:inline-block;padding:10px 20px;background:#d93025;color:white;text-decoration:none;border-radius:6px;font-weight:bold;">
-        View Tickets on StubHub
-      </a>
-      <p style="color:#aaa;font-size:12px;margin-top:16px;">Set quantity to {QUANTITY} once the page loads.</p>
-    </div>"""
-    _send(f"🚨 StubHub Alert — Noah Kahan STL ~${price:.0f}/ticket", html)
-
-
 def run_once() -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     state = load_state()
@@ -289,11 +246,11 @@ def run_once() -> None:
     if hourly_low is None or price < hourly_low["price"]:
         state["hourly_low"] = listing
 
-    # Send digest at the top of each even-numbered hour (every 2 hours)
+    # Send digest once per day (new calendar day in local time)
     last_digest = state.get("last_digest")
     new_hour = (
         not last_digest or
-        datetime.fromisoformat(last_digest).hour // 2 != datetime.now().hour // 2
+        datetime.fromisoformat(last_digest).date() != datetime.now().date()
     )
     if new_hour and state["hourly_low"]:
         trends = compute_trends(state["history"], state["hourly_low"]["price"])
@@ -302,19 +259,12 @@ def run_once() -> None:
         state["hourly_low"] = None
         print(f"[{ts}] Digest sent.", flush=True)
 
-    reasons = triggered_reasons(listing, state)
-    if reasons and not in_cooldown(state):
-        send_alert(listing, reasons)
-        state["last_alerted"] = datetime.now().isoformat()
-        print(f"[{ts}] Alert sent.", flush=True)
-
     save_state(state)
 
 
 def main() -> None:
     print(f"Watching: Noah Kahan STL (qty {QUANTITY})")
-    print(f"Interval: {CHECK_INTERVAL_MINUTES}min | Cooldown: {ALERT_COOLDOWN_HOURS}hr")
-    print(f"Thresholds: PRICE_BELOW={PRICE_BELOW}, PRICE_DROP_PCT={PRICE_DROP_PCT}%")
+    print(f"Interval: {CHECK_INTERVAL_MINUTES}min | Digest: daily")
     print()
     while True:
         run_once()

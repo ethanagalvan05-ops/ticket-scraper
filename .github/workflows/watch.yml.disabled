@@ -1,7 +1,6 @@
-# DISABLED 2026-05-30 — scraper now runs on the Digital Ocean droplet.
-# Schedule removed so this no longer runs automatically.
-# Kept as workflow_dispatch-only in case manual fallback is ever needed.
-# Full backup of the original is in watch.yml.disabled.
+# DISABLED 2026-05-30 — scraper now runs on Digital Ocean droplet.
+# Renamed from watch.yml to .disabled so GitHub Actions no longer picks it up.
+# To re-enable: rename back to watch.yml.
 
 name: Ticket Watcher (disabled)
 
